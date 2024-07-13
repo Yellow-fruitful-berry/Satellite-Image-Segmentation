@@ -12,6 +12,24 @@ import torchvision.transforms as transforms
 from torch import nn
 from matplotlib import pyplot as plt
 from io import BytesIO
+from flask import Flask, render_template, send_file, request, jsonify, send_from_directory
+from sentinelhub import SentinelHubRequest, DataCollection, MimeType, CRS, BBox, SHConfig, bbox_to_dimensions
+from io import BytesIO
+import os
+import numpy as np
+import torch
+from PIL import Image
+import numpy as np
+import pytorch_lightning as pl
+import segmentation_models_pytorch as smp
+import multiprocessing as mp
+from segmentation_models_pytorch.encoders import get_preprocessing_fn
+# from torch import nn
+from matplotlib import pyplot as plt
+from io import BytesIO
+
+import torch.nn as nn
+from torchvision.transforms import transforms
 
 IMG_SIZE = (512, 512)
 
@@ -60,6 +78,11 @@ class SegmentationModel(pl.LightningModule):
 model = SegmentationModel(net=net, loss=LOSS, lr=LR)
 model.load_state_dict(torch.load('/Users/roman/Desktop/StemGNN/classification_website/lightning_trained-v1.ckpt', map_location=torch.device('cpu')), strict=False)
 model.eval()
+
+# Configure Sentinel Hub
+config = SHConfig()
+config.sh_client_id = '72384d45-3b1a-4b1a-9915-7f69ae01e125'
+config.sh_client_secret = '10oJej5guXjV1888E5UJmy6uLaAHBeaH'
 
 
 # Perform one hot encoding on label
@@ -119,6 +142,7 @@ def colour_code_segmentation(image, label_values):
 
     return x
 
+
 # helper function for data visualization
 def visualize(**images):
     """PLot images in one row."""
@@ -132,63 +156,84 @@ def visualize(**images):
         plt.imshow(image)
     plt.show()
 
+
 reverse_transform = transforms.Compose([
             transforms.ToPILImage(),
             transforms.Resize(size=IMG_SIZE),
         ])
+
+
 def preprocess_image(image):
+    if isinstance (image, np.ndarray):
+        image = Image.fromarray (image)
     # Convert image to the required format for the model
     transform = transforms.Compose([
         transforms.Resize(IMG_SIZE),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.ToTensor()
     ])
-    image = transform(image).unsqueeze(0)  # Add batch dimension
+    image_tensor = transform(image)
+
+    # If the image has 4 channels (RGBA), convert it to RGB
+    if image_tensor.shape[0] == 4:
+        image_tensor = image_tensor[:3, :, :]  # Keep only RGB channels
+
+    # Normalize the image
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    image_tensor = normalize(image_tensor)
+
+    image_tensor = image_tensor.unsqueeze(0)  # Add batch dimension
+    return image_tensor
+
+def get_image(bbox_minx, bbox_miny, bbox_maxx, bbox_maxy, time_start, time_end):
+    time_range = (time_start, time_end)
+
+    evalscript = """
+            //VERSION=3
+            function setup() {
+                return {
+                    input: [{
+                        bands: ["B02", "B03", "B04"]
+                    }],
+                    output: {
+                        bands: 3
+                    }
+                };
+            }
+
+            function evaluatePixel(sample) {
+                return [sample.B04, sample.B03, sample.B02];
+            }
+            """
+
+    betsiboka_coords_wgs84 = (bbox_minx, bbox_miny, bbox_maxx, bbox_maxy)
+
+    resolution = 60
+    betsiboka_bbox = BBox (bbox=betsiboka_coords_wgs84, crs=CRS.WGS84)
+    betsiboka_size = bbox_to_dimensions (betsiboka_bbox, resolution=resolution)
+    size = (512, 512)
+    request = SentinelHubRequest (
+        evalscript=evalscript,
+        input_data=[
+            SentinelHubRequest.input_data (
+                data_collection=DataCollection.SENTINEL2_L1C,
+                time_interval=(time_start, time_end),
+            )
+        ],
+        responses=[SentinelHubRequest.output_response ("default", MimeType.PNG)],
+        bbox=betsiboka_bbox,
+        size=size,
+        config=config,
+    )
+
+    response = request.get_data()
+
+    # print(len(response))
+    # print(response[0].shape)
+
+    image = response[0]
+    # print(type(image))
+
     return image
-
-# def postprocess_output(output):
-#     # Convert model output to an image format
-#     output = output.squeeze(0).detach().cpu().numpy()  # Remove batch dimension
-#     output = np.argmax(output, axis=0)  # Assuming you have multiple classes
-#     output_image = Image.fromarray(output.astype(np.uint8))
-#     return output_image
-
-
-file = open('100877_sat.jpg', 'rb')
-image = Image.open(file)
-
-input_tensor = preprocess_image(image).to(DEVICE)
-with torch.no_grad():
-    output = model(input_tensor)
-
-output_image = output[0]# .permute(1, 2, 0)
-
-class_rgb_values = [[0, 255, 255], [255, 255, 0], [255, 0, 255], [0, 255, 0], [0, 0, 255], [255, 255, 255], [0, 0, 0]]
-
-image = preprocess_image(image)
-image = image.to('cpu')
-
-segmodel = model
-# Creating a batch of size 1 (unsqueeze(0)) for image
-pred = segmodel.forward(image)
-
-# Getting pred tensor from gpu to cpu, squeezing it and casting it to numpy
-pred = pred.cpu().detach().squeeze().numpy()
-
-# Getting gt_mask tensor from gpu to cpu and casting to uint8
-
-# reversing one_hot transformations (made in the Mining class object) of gt_mask and pred
-reversed_pred = reverse_one_hot(pred)
-
-# reapplying the original colors in the reversed one hot images
-# and getting them as uint8
-prediction = colour_code_segmentation(reversed_pred, class_rgb_values).astype(np.uint8)
-
-# visualize(
-#     # image=reverse_transform (imagevis),
-#     prediction=reverse_transform(prediction),
-#     # one_hot_mask=reverse_transform(reversed_gt_mask.astype(np.uint8)),
-# )
 
 
 @app.route('/')
@@ -198,13 +243,14 @@ def index():
 
 @app.route('/segment', methods=['POST'])
 def segment():
-    if 'file' not in request.files:
-        return jsonify(error='No file uploaded'), 400
+    bbox_minx = float (request.form['bbox_minx'])
+    bbox_miny = float (request.form['bbox_miny'])
+    bbox_maxx = float (request.form['bbox_maxx'])
+    bbox_maxy = float (request.form['bbox_maxy'])
+    time_start = request.form['time_start']
+    time_end = request.form['time_end']
 
-    # Test with a local file
-    # file = request.files['file']
-    file = open('100877_sat.jpg', 'rb')
-    image = Image.open(file)
+    image = get_image(bbox_minx, bbox_miny, bbox_maxx, bbox_maxy, time_start, time_end)
 
     input_tensor = preprocess_image (image).to (DEVICE)
     with torch.no_grad ():
