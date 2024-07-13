@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title><!-- index.html -->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Segmentation</title>
+</head>
+<body>
+    <h1>Satellite Image Segmentation</h1>
+    <form id="upload-form" enctype="multipart/form-data">
+        <input type="file" id="file" name="file" accept="image/*">
+        <button type="submit">Segment Image</button>
+    </form>
+    <div id="result">
+        <h2>Segmented Image:</h2>
+        <img id="segmented-image" src="" alt="Segmented Image">
+    </div>
+    <script>
+        document.getElementById('upload-form').onsubmit = async (e) => {
+            e.preventDefault();
+            const fileInput = document.getElementById('file');
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+
+            const response = await fetch('/segment', {
+                method: 'POST',
+                body: formData
+            });
+
+            if (response.ok) {
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                document.getElementById('segmented-image').src = url;
+            } else {
+                console.error('Segmentation failed:', await response.text());
+            }
+        };
+    </script>
+</body>
+</html>
